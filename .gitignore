@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/growth.db
+.streamlit/secrets.toml
+st_out.txt
+st_err.txt
