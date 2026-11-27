@@ -36,15 +36,15 @@ def generate(conn, as_of) -> list[dict]:
                                  "description": f"At {d}, {label.lower()} are {ov[key]:,} vs goal {ov[goal]:,}. Review scale/change/stop decisions and reallocate budget.",
                                  "campaign_id": None, "priority": "high"}})
     if ph == "post-event" or tot.attended > 0:
-        pct = ov["attended_unique_visitors"] / ov["visitors_goal"]
-        if pct < 1:
+        pct = ov["attended_unique_visitors"] / ov["visitors_goal"] if ov["visitors_goal"] else None
+        if pct is not None and pct < 1:
             out.append({"severity": "medium", "campaign_id": None,
                         "title": f"Unique visitors at {pct:.0%} of goal",
                         "detail": f"{ov['attended_unique_visitors']:,} vs {ov['visitors_goal']:,} (unique external people, admitted and verified).",
                         "task": None})
     else:
         pr = M.projection(conn, d)
-        pct = pr["projected_attendees"] / ov["visitors_goal"]
+        pct = pr["projected_attendees"] / ov["visitors_goal"] if ov["visitors_goal"] else 0.0
         out.append({"severity": "high" if pct < 0.85 else "low", "campaign_id": None,
                     "title": f"Projected attendees {pr['projected_attendees']:,} = {pct:.0%} of the {ov['visitors_goal']:,} goal",
                     "detail": f"Run-rate method (assumption-based): {pr['registrations_per_day_last14']}/day registrations over {pr['days_to_event']} days, "

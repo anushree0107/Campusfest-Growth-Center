@@ -107,3 +107,46 @@ def test_ask_wires_tools_history_and_proposals(conn):
     assert c.seen["n_contents"] == 3                       # 2 history turns + new message
     assert "the data cannot answer this" in c.seen["system"]  # honesty rule present
     assert "v_attendees" in c.seen["system"]                  # schema supplied for SQL tool
+
+
+def test_edge_cases_c08_unattr_trend_and_due_date(conn):
+    _, t = tools_of(conn)
+    r_c08 = t["get_campaign_metrics"](campaign="C08")
+    assert "error" in r_c08 and "planned campaign" in r_c08["error"]
+    r_unattr = t["get_campaign_metrics"](campaign="UNATTR")
+    assert len(r_unattr["campaigns"]) == 1 and r_unattr["campaigns"][0]["campaign_id"] == "UNATTR"
+    r_trend = t["get_trend"](as_of_date="2025-01-15")
+    assert r_trend["series"] == []
+    r_bad_due = t["propose_task"](title="Test", description="d", due_date="T-4w", rationale="r")
+    assert "error" in r_bad_due
+
+
+def test_fallback_cleans_up_failed_proposals(conn):
+    class FlakyClient:
+        def __init__(self):
+            self.models = self
+            self.calls = 0
+
+        def generate_content(self, model, contents, config):
+            self.calls += 1
+            fns = {f.__name__: f for f in config.tools}
+            fns["propose_task"](title=f"Proposal {self.calls}", description="d", rationale="r")
+            if self.calls == 1:
+                raise RuntimeError("transient 503")
+            return FakeResponse("Recovered")
+
+    n0 = len(store.pending_proposals(conn))
+    res = analyst.ask(conn, "2025-04-20", [], "do it", api_key="x", models=["m1", "m2"], client=FlakyClient())
+    assert res["answer"] == "Recovered"
+    assert res["model"] == "m2"
+    assert len(res["proposal_ids"]) == 1
+    assert len(store.pending_proposals(conn)) == n0 + 1
+
+
+def test_dotenv_reader(tmp_path):
+    p1 = tmp_path / ".env1"
+    p1.write_text("GEMINI_API_KEY=abc123\n", encoding="utf-8")
+    assert analyst._read_dotenv_key(p1) == "abc123"
+    p2 = tmp_path / ".env2"
+    p2.write_text("rawkey999\n", encoding="utf-8")
+    assert analyst._read_dotenv_key(p2) == "rawkey999"

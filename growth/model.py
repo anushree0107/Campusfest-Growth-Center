@@ -94,8 +94,8 @@ def project(baseline: pd.DataFrame, walk_2025: int, budgets: dict, scen: Scenari
     total = min(total, scen.capacity)
     spend = sum(budgets.values()) + scen.reserve
     return {"table": df, "gross": gross, "total": total, "baseline_total": base_total,
-            "total_budget": spend, "uplift_pct": total / base_total - 1,
-            "blended_cost_per_attendee": spend / total}
+            "total_budget": spend, "uplift_pct": (total / base_total - 1) if base_total else 0.0,
+            "blended_cost_per_attendee": (spend / total) if total else 0.0}
 
 
 def scenario_summary(baseline, walk_2025) -> pd.DataFrame:

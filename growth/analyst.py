@@ -13,13 +13,15 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pandas as pd
 
 from . import metrics as M, model, store
 
-DEFAULT_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
 FIRST_DAY, LAST_DAY = "2025-01-15", "2025-04-20"
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
 def _clean(obj):
@@ -106,11 +108,18 @@ def make_tools(ctx: Context):
         unique people). campaign = id (C01..C07) or name, empty = all. UNATTR = walk-ins without a campaign."""
         d = _resolve_date(ctx, as_of_date)
         df = M.campaign_funnel(conn, d)
-        cid = _match_campaign(conn, campaign)
-        if campaign and cid is None and campaign.upper() != "UNATTR":
-            return {"error": f"No campaign matches '{campaign}'. Campaigns: " + ", ".join(df.index.astype(str))}
-        if cid:
-            df = df.loc[[cid]]
+        if campaign and campaign.strip().upper() == "UNATTR":
+            if "UNATTR" not in df.index:
+                return {"as_of": d, "campaigns": []}
+            df = df.loc[["UNATTR"]]
+        else:
+            cid = _match_campaign(conn, campaign)
+            if campaign and cid is None:
+                return {"error": f"No campaign matches '{campaign}'. Campaigns: " + ", ".join(df.index.astype(str))}
+            if cid:
+                if cid not in df.index:
+                    return {"error": f"Campaign '{cid}' is a next-edition planned campaign with no 2025 historical funnel data. Campaigns with 2025 data: " + ", ".join(df.index.astype(str))}
+                df = df.loc[[cid]]
         cols = ["campaign_name", "identified", "registered", "confirmed", "cancelled", "waitlisted", "attended", "spend",
                 "reg_rate", "confirm_rate", "cancel_rate", "showup_rate", "cost_per_registration", "cost_per_confirmed",
                 "cost_per_attendee", "impressions", "clicks", "sessions", "reg_starts"]
@@ -132,6 +141,8 @@ def make_tools(ctx: Context):
         and spend. freq = 'daily' or 'weekly' (weekly uses the last day of each week)."""
         d = _resolve_date(ctx, as_of_date)
         s = M.daily_series(conn, d)
+        if s.empty:
+            return {"as_of": d, "freq": freq, "series": []}
         if freq == "weekly":
             s = s.resample("W").agg({"identified": "sum", "registered": "sum", "attended": "sum", "spend": "sum",
                                      "cum_identified": "last", "cum_registered": "last", "cum_attended": "last", "cum_spend": "last"})
@@ -246,8 +257,14 @@ def make_tools(ctx: Context):
         cid = _match_campaign(conn, campaign_id) if campaign_id else None
         if campaign_id and not cid:
             raise ValueError(f"Unknown campaign '{campaign_id}'")
+        norm_due = None
+        if due_date and due_date.strip():
+            try:
+                norm_due = pd.Timestamp(due_date.strip()).strftime("%Y-%m-%d")
+            except Exception:
+                raise ValueError(f"due_date '{due_date}' must be YYYY-MM-DD")
         pid = store.create_proposal(conn, "task", {"title": title, "description": description, "campaign_id": cid,
-                                                   "owner": owner or None, "due_date": due_date or None,
+                                                   "owner": owner or None, "due_date": norm_due,
                                                    "priority": priority if priority in store.PRIORITIES else "medium"}, rationale)
         ctx.proposals.append(pid)
         return {"proposal_id": pid, "status": "pending user confirmation", "note": "Tell the user it is awaiting their confirmation."}
@@ -315,6 +332,27 @@ class AnalystError(Exception):
     pass
 
 
+def _read_dotenv_key(env_path: Path = ENV_PATH) -> str:
+    if not env_path.is_file():
+        return ""
+    try:
+        lines = [ln.strip() for ln in env_path.read_text(encoding="utf-8").splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:
+        return ""
+    for ln in lines:
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            if k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                val = v.strip().strip('"').strip("'")
+                if val:
+                    return val
+    if len(lines) == 1 and "=" not in lines[0]:
+        return lines[0].strip('"').strip("'")
+    return ""
+
+
 def get_api_key(secrets=None, override: str = "") -> str:
     if override:
         return override
@@ -326,7 +364,7 @@ def get_api_key(secrets=None, override: str = "") -> str:
                 return secrets[k]
         except Exception:
             pass
-    return ""
+    return _read_dotenv_key()
 
 
 def ask(conn, as_of: str, history: list[dict], user_msg: str, api_key: str, models: list[str] | None = None,
@@ -338,17 +376,23 @@ def ask(conn, as_of: str, history: list[dict], user_msg: str, api_key: str, mode
 
     ctx = Context(conn=conn, as_of=as_of)
     tools = make_tools(ctx)
-    client = client or genai.Client(api_key=api_key)
+    client = client or genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=25000))
     contents = [types.Content(role="user" if h["role"] == "user" else "model", parts=[types.Part(text=h["content"])])
                 for h in history]
     contents.append(types.Content(role="user", parts=[types.Part(text=user_msg)]))
     cfg = types.GenerateContentConfig(
         system_instruction=system_prompt(ctx), tools=tools, temperature=0.2,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=10))
     last_err = None
     for name in (models or DEFAULT_MODELS):
         try:
             ctx.trace.clear()
+            if ctx.proposals:
+                ph = ",".join("?" for _ in ctx.proposals)
+                conn.execute(f"DELETE FROM proposals WHERE proposal_id IN ({ph}) AND status='pending'", ctx.proposals)
+                conn.commit()
+                ctx.proposals.clear()
             resp = client.models.generate_content(model=name, contents=contents, config=cfg)
             text = (resp.text or "").strip()
             if not text:
@@ -357,4 +401,9 @@ def ask(conn, as_of: str, history: list[dict], user_msg: str, api_key: str, mode
         except Exception as e:  # try next model on quota / availability errors
             last_err = e
             continue
+    if ctx.proposals:
+        ph = ",".join("?" for _ in ctx.proposals)
+        conn.execute(f"DELETE FROM proposals WHERE proposal_id IN ({ph}) AND status='pending'", ctx.proposals)
+        conn.commit()
+        ctx.proposals.clear()
     raise AnalystError(f"Gemini call failed: {last_err}")

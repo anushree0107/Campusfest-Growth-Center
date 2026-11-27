@@ -3,5 +3,6 @@ __pycache__/
 .pytest_cache/
 data/growth.db
 .streamlit/secrets.toml
+.env
 st_out.txt
 st_err.txt

@@ -189,7 +189,7 @@ def flags(conn, as_of, df: pd.DataFrame | None = None) -> pd.DataFrame:
                 rows.append((cid, "INSUFFICIENT DATA", "No confirmed registrations yet."))
                 continue
             # Pre-event, spend is front-loaded, so compare against the portfolio median instead of absolute INR.
-            ratio = cpc / med_cpc if med_cpc else 1.0
+            ratio = cpc / med_cpc if (pd.notna(med_cpc) and med_cpc > 0) else 1.0
             cr = 0.0 if pd.isna(cr) else cr
             if ratio > s["stop_cpc_ratio"]:
                 d, why = "STOP", f"Cost per confirmed registration Rs {cpc:,.0f} is {ratio:.1f}x the portfolio median (Rs {med_cpc:,.0f}); stop limit {s['stop_cpc_ratio']:.1f}x."

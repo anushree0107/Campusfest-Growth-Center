@@ -1,6 +1,7 @@
 """CampusFest Growth Center - dashboard, execution manager and embedded AI analyst (Streamlit)."""
 from __future__ import annotations
 
+import inspect
 import json
 
 import pandas as pd
@@ -14,6 +15,7 @@ st.set_page_config(page_title="CampusFest Growth Center", page_icon="🎪", layo
 
 DECISION_COLORS = {"SCALE": "#1b9e4b", "HOLD": "#8a8f98", "CHANGE": "#e08a00", "STOP": "#d62d3a", "INSUFFICIENT DATA": "#b0b4ba"}
 HIST_START, HIST_END = pd.Timestamp("2025-01-15").date(), pd.Timestamp("2025-04-20").date()
+_STRETCH = {"width": "stretch"} if "width" in inspect.signature(st.button).parameters else {"use_container_width": True}
 
 
 @st.cache_resource
@@ -37,16 +39,65 @@ def style_decision(v):
     return f"background-color:{c};color:white;font-weight:600" if c else ""
 
 
+def _stage_color(v, vmin: float = 0.4, vmax: float = 1.0) -> str:
+    if v is None or pd.isna(v):
+        return ""
+    t = max(0.0, min(1.0, (float(v) - vmin) / (vmax - vmin)))
+    # Soft pastel RdYlGn interpolation with dark text (no matplotlib dependency)
+    if t < 0.5:
+        u = t * 2.0
+        r = int(248 + (255 - 248) * u)
+        g = int(198 + (240 - 198) * u)
+        b = int(194 + (179 - 194) * u)
+    else:
+        u = (t - 0.5) * 2.0
+        r = int(255 + (188 - 255) * u)
+        g = int(240 + (229 - 240) * u)
+        b = int(179 + (200 - 179) * u)
+    return f"background-color:rgb({r},{g},{b});color:#1b2330"
+
+
+def _style_map(styler, fn, subset):
+    mapper = getattr(styler, "map", None) or styler.applymap
+    return mapper(fn, subset=subset)
+
+
+def _same_val(a, b) -> bool:
+    if pd.isna(a) and pd.isna(b):
+        return True
+    return a == b
+
+
 # ------------------------------------------------------------------ sidebar
 st.sidebar.title("CampusFest Growth Center")
 st.sidebar.caption(f"City: {store.get_meta(conn, 'city')} | Challenge A: Attendee Growth")
-as_of = st.sidebar.date_input(
-    "Snapshot date (end of day, IST)", value=HIST_END, min_value=HIST_START, max_value=HIST_END,
-    help="All 2025 analytics are computed as at the end of this day. Later outcomes never leak into earlier dates.")
-jump = st.sidebar.radio("Quick jump", ["Custom", "T-4 weeks (14 Mar)", "T-3 weeks (20 Mar)", "Event eve (11 Apr)", "Final (20 Apr)"], index=0, horizontal=False)
 JUMPS = {"T-4 weeks (14 Mar)": "2025-03-14", "T-3 weeks (20 Mar)": "2025-03-20", "Event eve (11 Apr)": "2025-04-11", "Final (20 Apr)": "2025-04-20"}
-if jump in JUMPS:
-    as_of = pd.Timestamp(JUMPS[jump]).date()
+
+
+def _on_jump_change():
+    j = st.session_state.get("jump_radio")
+    if j in JUMPS:
+        st.session_state["as_of_date"] = pd.Timestamp(JUMPS[j]).date()
+
+
+def _on_date_change():
+    cur = st.session_state.get("as_of_date")
+    match = next((k for k, v in JUMPS.items() if pd.Timestamp(v).date() == cur), "Custom")
+    st.session_state["jump_radio"] = match
+
+
+if "as_of_date" not in st.session_state:
+    st.session_state["as_of_date"] = HIST_END
+if "jump_radio" not in st.session_state:
+    st.session_state["jump_radio"] = "Final (20 Apr)"
+
+as_of = st.sidebar.date_input(
+    "Snapshot date (end of day, IST)", min_value=HIST_START, max_value=HIST_END,
+    key="as_of_date", on_change=_on_date_change,
+    help="All 2025 analytics are computed as at the end of this day. Later outcomes never leak into earlier dates.")
+st.sidebar.radio(
+    "Quick jump", ["Custom", *JUMPS.keys()], horizontal=False,
+    key="jump_radio", on_change=_on_jump_change)
 AS_OF = str(as_of)
 PHASE = M.phase(conn, AS_OF)
 st.sidebar.markdown(f"**Phase:** {PHASE}")
@@ -80,6 +131,7 @@ camps = df.drop(index="UNATTR", errors="ignore")
 tot = M.totals(df)
 ov = M.overview(conn, AS_OF)
 flags = M.flags(conn, AS_OF, df)
+bn = M.bottlenecks(df)
 
 # ================================================================== MEASURE
 with tab_dash:
@@ -87,15 +139,16 @@ with tab_dash:
     st.caption(f"Goals/budget version in force: **{ov['target_version']}**. People = unique external people. "
                "Impressions, reach, sessions and registration starts are anonymous activity, not people.")
     c = st.columns(6)
-    c[0].metric("Identified people", f"{ov['identified']:,}", f"{ov['identified_pct_of_goal']:.0%} of {ov['identified_goal']:,}")
-    c[1].metric("Registered", f"{ov['registered']:,}", f"{ov['registered_pct_of_goal']:.0%} of {ov['registration_goal']:,}")
+    c[0].metric("Identified people", f"{ov['identified']:,}", f"{ov['identified_pct_of_goal']:.0%} of {ov['identified_goal']:,}" if ov["identified_pct_of_goal"] is not None else "-")
+    c[1].metric("Registered", f"{ov['registered']:,}", f"{ov['registered_pct_of_goal']:.0%} of {ov['registration_goal']:,}" if ov["registered_pct_of_goal"] is not None else "-")
     c[2].metric("Confirmed", f"{ov['confirmed']:,}", f"{ov['confirmed'] / max(ov['registered'], 1):.0%} of registered", delta_color="off")
     if PHASE == "pre-event":
         pr = M.projection(conn, AS_OF)
-        c[3].metric("Projected attendees", f"{pr['projected_attendees']:,}", f"{pr['projected_attendees'] / ov['visitors_goal']:.0%} of {ov['visitors_goal']:,} (assumption-based)", delta_color="off")
+        proj_delta = f"{pr['projected_attendees'] / ov['visitors_goal']:.0%} of {ov['visitors_goal']:,} (assumption-based)" if ov["visitors_goal"] else "assumption-based"
+        c[3].metric("Projected attendees", f"{pr['projected_attendees']:,}", proj_delta, delta_color="off")
     else:
-        c[3].metric("Unique visitors (attended)", f"{ov['attended_unique_visitors']:,}", f"{ov['attended_unique_visitors_pct_of_goal']:.0%} of {ov['visitors_goal']:,}")
-    c[4].metric("Spend", inr(ov["spend_inr"]), f"{ov['spend_inr_pct_of_goal']:.0%} of {inr(ov['budget_inr'])}", delta_color="off")
+        c[3].metric("Unique visitors (attended)", f"{ov['attended_unique_visitors']:,}", f"{ov['attended_unique_visitors_pct_of_goal']:.0%} of {ov['visitors_goal']:,}" if ov["attended_unique_visitors_pct_of_goal"] is not None else "-")
+    c[4].metric("Spend", inr(ov["spend_inr"]), f"{ov['spend_inr_pct_of_goal']:.0%} of {inr(ov['budget_inr'])}" if ov["spend_inr_pct_of_goal"] is not None else "-", delta_color="off")
     if ov["cost_per_attendee"]:
         c[5].metric("Cost per attendee", inr(ov["cost_per_attendee"]), f"cost per registration {inr(ov['cost_per_registration'])}", delta_color="off")
     else:
@@ -108,7 +161,7 @@ with tab_dash:
         fig = go.Figure(go.Funnel(y=stages, x=vals, textinfo="value+percent previous",
                                   marker={"color": ["#4c78a8", "#72b7b2", "#54a24b", "#e45756"]}))
         fig.update_layout(title="Person-level funnel (unique external people)", height=360, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, **_STRETCH)
     with right:
         gdf = pd.DataFrame({"metric": ["Identified", "Registered", "Unique visitors"],
                             "Actual": [ov["identified"], ov["registered"], ov["attended_unique_visitors"]],
@@ -117,7 +170,7 @@ with tab_dash:
         fig.add_bar(x=gdf.metric, y=gdf.Goal, name="Goal", marker_color="#c9ced6")
         fig.add_bar(x=gdf.metric, y=gdf.Actual, name="Actual", marker_color="#4c78a8")
         fig.update_layout(barmode="group", title="Targets vs actuals", height=360, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, **_STRETCH)
 
     ser = M.daily_series(conn, AS_OF)
     if not ser.empty:
@@ -133,7 +186,7 @@ with tab_dash:
         fig.add_trace(sp)
         fig.update_layout(title="Growth over time", height=380, yaxis2=dict(overlaying="y", side="right", title="Rs"),
                           margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, **_STRETCH)
 
     st.markdown("#### Campaign KPIs")
     show = df[["campaign_name", "identified", "registered", "confirmed", "cancelled", "attended", "spend", "reg_rate",
@@ -145,14 +198,14 @@ with tab_dash:
     st.dataframe(show.style.format({"Spend (Rs)": "{:,.0f}", "Reg. rate": "{:.0%}", "Show-up": "{:.0%}", "Cost/registration": "{:,.0f}",
                                     "Cost/confirmed": "{:,.0f}", "Cost/attendee": "{:,.0f}", "Identified": "{:,.0f}",
                                     "Registered": "{:,.0f}", "Confirmed": "{:,.0f}", "Cancelled": "{:,.0f}", "Attended": "{:,.0f}"}, na_rep="-"),
-                 use_container_width=True)
+                 **_STRETCH)
     if "UNATTR" in df.index:
         st.caption("Walk-in / unattributed: attendees without a registration or campaign; they count in unique visitors but have no spend or cost metrics.")
 
     with st.expander("Anonymous activity funnel (not unique people)"):
         a = df.drop(index="UNATTR", errors="ignore")[["campaign_name", "impressions", "reach", "clicks", "sessions", "reg_starts", "registered"]]
         a.columns = ["Campaign", "Impressions", "Reported reach", "Clicks", "Landing sessions", "Registration starts", "Registered people"]
-        st.dataframe(a.style.format("{:,.0f}", subset=a.columns[1:]), use_container_width=True)
+        st.dataframe(a.style.format("{:,.0f}", subset=a.columns[1:]), **_STRETCH)
         st.caption("Summed reach and impressions do not prove incremental attendance and are not unique people.")
 
 # ================================================================== DIAGNOSE
@@ -193,7 +246,7 @@ with tab_diag:
                          color_discrete_map=DECISION_COLORS, labels={"quality": xlab, "cost_metric": ylab, "color": "Flag"})
         fig.update_traces(textposition="top center")
         fig.update_layout(title="Efficiency map (bubble = registrations)", height=420, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, **_STRETCH)
     with cR:
         if camps.spend.sum() > 0:
             share = pd.DataFrame({"Campaign": camps.campaign_name,
@@ -204,17 +257,16 @@ with tab_diag:
                 share = share.drop(columns=["Share of attendees"])
             fig = px.bar(share.melt("Campaign"), x="Campaign", y="value", color="variable", barmode="group", labels={"value": "Share", "variable": ""})
             fig.update_layout(title="Where the money goes vs what comes back", height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, **_STRETCH)
 
     st.markdown("#### Stage conversion by campaign (weakest stage vs portfolio median)")
-    bn = M.bottlenecks(df)
     stg = camps[["campaign_name", "reg_rate", "confirm_rate", "attended_per_confirmed", "cancel_rate", "session_to_start"]].copy()
     stg.columns = ["Campaign", "Identified > registered", "Registered > confirmed", "Confirmed > attended", "Cancellation rate", "Session > reg. start (anon.)"]
     stg["Weakest stage"] = bn.bottleneck_stage
     stg["Gap vs median"] = bn.gap_vs_median
-    st.dataframe(stg.style.format({c_: "{:.0%}" for c_ in stg.columns if c_ not in ("Campaign", "Weakest stage")}, na_rep="-")
-                 .background_gradient(subset=["Identified > registered", "Registered > confirmed", "Confirmed > attended"], cmap="RdYlGn", vmin=0.4, vmax=1.0),
-                 use_container_width=True)
+    stg_styled = stg.style.format({c_: "{:.0%}" for c_ in stg.columns if c_ not in ("Campaign", "Weakest stage")}, na_rep="-")
+    stg_styled = _style_map(stg_styled, _stage_color, subset=["Identified > registered", "Registered > confirmed", "Confirmed > attended"])
+    st.dataframe(stg_styled, **_STRETCH)
 
     st.markdown("#### Momentum: last 7 days vs previous 7 days (what changed)")
     mom = M.momentum(conn, AS_OF, 7)
@@ -223,10 +275,10 @@ with tab_diag:
         mom = mom.drop(columns=["campaign_id"], errors="ignore")
         mom.columns = ["Registrations (now)", "Spend (now)", "Registrations (prev)", "Spend (prev)", "Registration change"]
         st.dataframe(mom.style.format({"Registration change": "{:+.0%}", "Spend (now)": "{:,.0f}", "Spend (prev)": "{:,.0f}",
-                                       "Registrations (now)": "{:,.0f}", "Registrations (prev)": "{:,.0f}"}, na_rep="-"), use_container_width=True)
+                                       "Registrations (now)": "{:,.0f}", "Registrations (prev)": "{:,.0f}"}, na_rep="-"), **_STRETCH)
 
     with st.expander("Identified-person engagement by campaign"):
-        st.dataframe(M.engagement(conn, AS_OF), use_container_width=True)
+        st.dataframe(M.engagement(conn, AS_OF), **_STRETCH)
 
 # ================================================================== DECIDE
 with tab_dec:
@@ -235,8 +287,9 @@ with tab_dec:
     fl = flags.join(camps[["campaign_name", "spend", "registered", "attended", "cost_per_confirmed", "cost_per_attendee"]]).join(bn[["bottleneck_stage"]])
     fl = fl[["campaign_name", "decision", "reason", "spend", "registered", "attended", "bottleneck_stage"]]
     fl.columns = ["Campaign", "Decision", "Why", "Spend (Rs)", "Registered", "Attended", "Weakest stage"]
-    st.dataframe(fl.style.applymap(style_decision, subset=["Decision"]).format({"Spend (Rs)": "{:,.0f}", "Registered": "{:,.0f}", "Attended": "{:,.0f}"}),
-                 use_container_width=True)
+    fl_styled = _style_map(fl.style, style_decision, subset=["Decision"]).format(
+        {"Spend (Rs)": "{:,.0f}", "Registered": "{:,.0f}", "Attended": "{:,.0f}"}, na_rep="-")
+    st.dataframe(fl_styled, **_STRETCH)
 
     st.markdown("---")
     st.subheader("Budget allocation planner (next edition)")
@@ -269,7 +322,7 @@ with tab_dec:
     t = t[["campaign_name", "spend_2025", "budget_inr", "attended_2025", "attended", "showup", "cost_per_attendee", "reach_needed"]]
     t.columns = ["Campaign", "2025 spend", "Planned budget", "2025 attended", "Projected attended", "Projected show-up", "Cost/attendee", "Reach needed (anon.)"]
     st.dataframe(t.style.format({"2025 spend": "{:,.0f}", "Planned budget": "{:,.0f}", "2025 attended": "{:,.0f}", "Projected attended": "{:,.0f}",
-                                 "Projected show-up": "{:.0%}", "Cost/attendee": "{:,.0f}", "Reach needed (anon.)": "{:,.0f}"}, na_rep="-"), use_container_width=True)
+                                 "Projected show-up": "{:.0%}", "Cost/attendee": "{:,.0f}", "Reach needed (anon.)": "{:,.0f}"}, na_rep="-"), **_STRETCH)
     if st.button("Save these budgets to the campaign plan"):
         for cid, v in new_budgets.items():
             store.update_campaign_plan(conn, cid, budget_inr=float(v))
@@ -281,13 +334,13 @@ with tab_dec:
         ss2 = ss.copy()
         st.dataframe(ss2.style.format({"budget_inr": "{:,.0f}", "identified": "{:,.0f}", "registered": "{:,.0f}", "attended_campaigns": "{:,.0f}",
                                        "attendees": "{:,.0f}", "vs_2025_pct": "{:+.0%}", "cost_per_attendee": "{:,.0f}", "reach_needed": "{:,.0f}"}),
-                     use_container_width=True)
+                     **_STRETCH)
 
     st.markdown("---")
     st.subheader("Five bets: prioritization (RICE-style: expected attendees x confidence / effort)")
     ideas = pd.read_sql("SELECT idea_id, rank, name, decision, expected_attendees, confidence, effort, budget_inr, kpi, scale_rule, change_rule, stop_rule FROM ideas ORDER BY rank IS NULL, rank", conn)
     ideas["score"] = ideas.expected_attendees.clip(lower=0) * ideas.confidence / ideas.effort.replace(0, pd.NA)
-    st.dataframe(ideas.rename(columns={"expected_attendees": "Incremental attendees (base)"}), use_container_width=True)
+    st.dataframe(ideas.rename(columns={"expected_attendees": "Incremental attendees (base)"}), **_STRETCH)
 
 # ================================================================== EXECUTE
 with tab_exec:
@@ -315,7 +368,7 @@ with tab_exec:
     with left:
         st.markdown("#### Campaign plan (budgets, goals, status)")
         plan = pd.read_sql("SELECT campaign_id, name, channel, owner, budget_inr, attendee_goal, status, kind, notes FROM campaign_plan ORDER BY campaign_id", conn)
-        edited = st.data_editor(plan, key="plan_editor", hide_index=True, use_container_width=True,
+        edited = st.data_editor(plan, key="plan_editor", hide_index=True, **_STRETCH,
                                 disabled=["campaign_id", "name", "channel", "kind"],
                                 column_config={"status": st.column_config.SelectboxColumn(options=store.CAMPAIGN_STATUSES),
                                                "budget_inr": st.column_config.NumberColumn("budget_inr", min_value=0, step=1000)})
@@ -323,7 +376,17 @@ with tab_exec:
             n = 0
             for i, r in edited.iterrows():
                 o = plan.loc[i]
-                ch = {k: r[k] for k in ("budget_inr", "attendee_goal", "status", "owner", "notes") if r[k] != o[k]}
+                ch = {}
+                for k_ in ("budget_inr", "attendee_goal", "status", "owner", "notes"):
+                    if not _same_val(r[k_], o[k_]):
+                        v = None if pd.isna(r[k_]) else r[k_]
+                        if k_ == "budget_inr":
+                            v = 0.0 if v is None else float(v)
+                        elif k_ == "attendee_goal":
+                            v = 0 if v is None else int(v)
+                        elif k_ == "notes" and v is None:
+                            v = ""
+                        ch[k_] = v
                 if ch:
                     store.update_campaign_plan(conn, r.campaign_id, **ch)
                     n += 1
@@ -343,7 +406,6 @@ with tab_exec:
                 st.rerun()
 
     st.markdown("#### Tasks")
-    owners = sorted({r[0] for r in conn.execute("SELECT DISTINCT owner FROM campaign_plan WHERE owner IS NOT NULL")} | {r[0] for r in conn.execute("SELECT DISTINCT owner FROM tasks WHERE owner IS NOT NULL")})
     cids = [""] + [r[0] for r in conn.execute("SELECT campaign_id FROM campaign_plan ORDER BY campaign_id")]
     with st.expander("Add task", expanded=False):
         with st.form("new_task"):
@@ -363,7 +425,8 @@ with tab_exec:
                     st.error(str(e))
     tasks = store.list_tasks(conn)
     today = pd.Timestamp(plan_date)
-    tasks["overdue"] = (tasks.status != "done") & (pd.to_datetime(tasks.due_date) < today)
+    due_ts = pd.to_datetime(tasks.due_date, errors="coerce")
+    tasks["overdue"] = (tasks.status != "done") & due_ts.notna() & (due_ts < today)
     k = st.columns(5)
     for i, s_ in enumerate(store.TASK_STATUSES):
         k[i].metric(s_.replace("_", " ").title(), int((tasks.status == s_).sum()))
@@ -371,9 +434,9 @@ with tab_exec:
     fcamp = st.selectbox("Filter by campaign", ["All"] + cids[1:], key="task_filter")
     view = tasks if fcamp == "All" else tasks[tasks.campaign_id == fcamp]
     view = view.copy()
-    view["due_date"] = pd.to_datetime(view.due_date).dt.date
+    view["due_date"] = pd.to_datetime(view.due_date, errors="coerce").dt.date
     ed = st.data_editor(view[["task_id", "title", "campaign_id", "owner", "due_date", "priority", "status", "source", "overdue"]],
-                        key="task_editor", hide_index=True, use_container_width=True, num_rows="fixed",
+                        key="task_editor", hide_index=True, **_STRETCH, num_rows="fixed",
                         disabled=["task_id", "source", "overdue"],
                         column_config={"status": st.column_config.SelectboxColumn(options=store.TASK_STATUSES),
                                        "priority": st.column_config.SelectboxColumn(options=store.PRIORITIES),
@@ -386,10 +449,14 @@ with tab_exec:
             o = view.loc[i]
             ch = {}
             for k_ in ("title", "campaign_id", "owner", "priority", "status"):
-                if (r[k_] if pd.notna(r[k_]) else None) != (o[k_] if pd.notna(o[k_]) else None):
-                    ch[k_] = r[k_]
-            if r.due_date != o.due_date:
-                ch["due_date"] = str(r.due_date)
+                nv = None if pd.isna(r[k_]) else r[k_]
+                ov_ = None if pd.isna(o[k_]) else o[k_]
+                if nv != ov_:
+                    ch[k_] = nv
+            nd = None if pd.isna(r.due_date) else str(r.due_date)
+            od = None if pd.isna(o.due_date) else str(o.due_date)
+            if nd != od:
+                ch["due_date"] = nd
             if ch:
                 store.update_task(conn, int(r.task_id), **ch)
                 n += 1
@@ -417,7 +484,7 @@ with tab_exec:
             st.success("Added. Dashboard updated.")
             st.rerun()
     with st.expander("Change log"):
-        st.dataframe(pd.read_sql("SELECT at, actor, action, detail FROM change_log ORDER BY log_id DESC LIMIT 100", conn), use_container_width=True)
+        st.dataframe(pd.read_sql("SELECT at, actor, action, detail FROM change_log ORDER BY log_id DESC LIMIT 100", conn), **_STRETCH)
 
 # ================================================================== AI ANALYST
 with tab_ai:
@@ -434,7 +501,7 @@ with tab_ai:
     ec = st.columns(len(examples))
     clicked = None
     for i, e in enumerate(examples):
-        if ec[i].button(e, key=f"ex_{i}", use_container_width=True):
+        if ec[i].button(e, key=f"ex_{i}", **_STRETCH):
             clicked = e
     if st.button("Clear conversation"):
         st.session_state.messages = []
@@ -443,7 +510,8 @@ with tab_ai:
         with st.chat_message(m_["role"]):
             st.markdown(m_["content"])
             if m_.get("trace"):
-                with st.expander(f"Data used ({len(m_['trace'])} tool call(s))"):
+                label = f"Data used ({len(m_['trace'])} tool call(s))" + (f" - model {m_['model']}" if m_.get("model") else "")
+                with st.expander(label):
                     for tr in m_["trace"]:
                         st.markdown(f"`{tr['tool']}` args: `{json.dumps(tr['args'], default=str)}`")
                         st.json(tr["result"], expanded=False)
@@ -452,16 +520,16 @@ with tab_ai:
         if not api_key:
             st.error("Add a Gemini API key in the sidebar (or GEMINI_API_KEY in secrets/env) to use the analyst.")
         else:
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            hist = [{"role": m_["role"], "content": m_["content"]} for m_ in st.session_state.messages]
             with st.chat_message("user"):
                 st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner("Querying the data..."):
                     try:
-                        hist = [{"role": m_["role"], "content": m_["content"]} for m_ in st.session_state.messages[:-1]]
                         res = analyst.ask(conn, AS_OF, hist, prompt, api_key)
+                        st.session_state.messages.append({"role": "user", "content": prompt})
+                        st.session_state.messages.append({"role": "assistant", "content": res["answer"], "trace": res["trace"], "model": res["model"]})
                         st.markdown(res["answer"])
-                        st.session_state.messages.append({"role": "assistant", "content": res["answer"], "trace": res["trace"]})
                         if res["trace"]:
                             with st.expander(f"Data used ({len(res['trace'])} tool call(s)) - model {res['model']}"):
                                 for tr in res["trace"]:
@@ -469,7 +537,8 @@ with tab_ai:
                                     st.json(tr["result"], expanded=False)
                     except Exception as e:
                         st.error(f"The analyst could not answer: {e}")
-            st.rerun() if store.pending_proposals(conn).shape[0] else None
+            if store.pending_proposals(conn).shape[0]:
+                st.rerun()
     pend = store.pending_proposals(conn)
     if len(pend):
         st.markdown("#### Proposed actions awaiting confirmation")
@@ -490,16 +559,16 @@ with tab_ai:
 with tab_set:
     st.subheader("Thresholds (scale / change / stop rules)")
     sdf = pd.read_sql("SELECT key, value, description FROM settings ORDER BY rowid", conn)
-    sed = st.data_editor(sdf, hide_index=True, use_container_width=True, disabled=["key", "description"], key="settings_editor")
+    sed = st.data_editor(sdf, hide_index=True, **_STRETCH, disabled=["key", "description"], key="settings_editor")
     if st.button("Save thresholds"):
         for i, r in sed.iterrows():
-            if r.value != sdf.loc[i, "value"]:
+            if pd.notna(r.value) and r.value != sdf.loc[i, "value"]:
                 store.update_setting(conn, r.key, r.value)
         st.success("Saved. Flags recompute.")
         st.rerun()
 
     st.subheader("Goal and budget versions")
-    st.dataframe(pd.read_sql("SELECT * FROM targets ORDER BY effective_at", conn), use_container_width=True)
+    st.dataframe(pd.read_sql("SELECT * FROM targets ORDER BY effective_at", conn), **_STRETCH)
     with st.form("target_form"):
         c = st.columns(6)
         te = c[0].date_input("Effective", value=as_of)
@@ -513,7 +582,7 @@ with tab_set:
             st.rerun()
 
     st.subheader("Data quality (ETL log)")
-    st.dataframe(pd.read_sql("SELECT * FROM etl_log", conn), use_container_width=True)
+    st.dataframe(pd.read_sql("SELECT * FROM etl_log", conn), **_STRETCH)
     st.caption("Duplicate import rows (same stable ID) are removed. Internal, staff and test people are excluded from all attendee metrics. "
                "Walk-ins appear as unattributed attendance.")
     st.subheader("Reset")
